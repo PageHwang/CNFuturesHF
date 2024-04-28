@@ -10,29 +10,45 @@ from joblib import Parallel, delayed # type: ignore
 class Futures():
     def __init__(self, data_path='C:/users/yuxuan.huang/OneDrive - SAIF/tower data/') -> None:
         self.data_path = data_path
-        self.exchanges = os.listdir(self.data_path)
-        self.exchange_bid_contract_dict = self.get_exchange_bid_contract_dict()
+        self.exchanges = [d for d in os.listdir(self.data_path) if os.path.isdir(os.path.join(self.data_path, d))]
 
-    def get_exchange_bid_contract_dict(self):
-        exchange_bid_contract_dict = {}
-
+    @property
+    def info(self):
+        return pd.read_csv(self.data_path+'future_info.csv',index_col=0)
+    
+    @property
+    def bid_list(self):
+        bid_list = []
         for exchange in self.exchanges:
-            exchange_bid_contract_dict[exchange] = {}
             bids = os.listdir(self.data_path+'/'+exchange)
             for bid in bids:
-                exchange_bid_contract_dict[exchange][bid] = {}
+                bid_list.append(bid)
+        return bid_list
+
+    @property
+    def exchange2bid2contract_dict(self):
+        exchange2bid2contract_dict = {}
+
+        for exchange in self.exchanges:
+            exchange2bid2contract_dict[exchange] = {}
+            bids = os.listdir(self.data_path+'/'+exchange)
+            for bid in bids:
+                exchange2bid2contract_dict[exchange][bid] = {}
                 contract_file_name_list = os.listdir(self.data_path+exchange+'/'+bid+'/')
                 for contract_file_name in contract_file_name_list:
                     contract_path = self.data_path+exchange+'/'+bid+'/'+contract_file_name
                     contract = contract_file_name[:6]
-                    exchange_bid_contract_dict[exchange][bid][contract] = contract_path
-        return exchange_bid_contract_dict
+                    exchange2bid2contract_dict[exchange][bid][contract] = contract_path
+        return exchange2bid2contract_dict
     
-    def get_daily_df_of_exchange(self,exchange,bid):
-        contract_list = list(self.exchange_bid_contract_dict[exchange][bid].keys())
+    def get_daily_vol(self,bid):
+        exchange = self.info.loc[bid,'exchange']
+        contract_list = list(self.exchange2bid2contract_dict[exchange][bid].keys())
         daily_vol_df = pd.DataFrame()
         for contract in contract_list:
-            df = pd.read_parquet(self.exchange_bid_contract_dict[exchange][bid][contract])
+            file_path = self.exchange2bid2contract_dict[exchange][bid][contract]
+
+            df = pd.read_parquet(file_path)
 
             df = df[(df.index.time >= pd.to_datetime('08:59').time()) & 
                     (df.index.time <= pd.to_datetime('15:00').time())]
@@ -44,38 +60,45 @@ class Futures():
             daily_vol_df = pd.concat([daily_vol_df,daily_vol_ser],axis=1)
 
         daily_vol_df.dropna(axis=0, how='all', inplace=True)
+        daily_vol_df.sort_index(inplace=True)
         return daily_vol_df
 
-    def find_main_contract(self,exchange,bid):
-        daily_vol_df = self.get_daily_df_of_exchange(exchange,bid)
+    def find_main_contract(self,bid):
+        daily_vol_df = self.get_daily_vol(bid)
 
         rolling3mean = daily_vol_df.rolling(3,min_periods=1).mean()
         rolling3mean.fillna(0,inplace=True)
         
         main_contracts = rolling3mean.idxmax(axis=1)
-
-        main_contracts = self.cancel_callback(main_contracts)
         
         return main_contracts
 
     def cancel_callback(self,main_contracts):
-        history_contracts = set()
+        history_contracts = dict()
         last_contract = main_contracts.iloc[0]
         for date, contract in main_contracts.items():
+            knock = {}
             if contract!=last_contract:
-                if contract in history_contracts:
-                    print("call back ",contract, "on ", date)
-                    main_contracts[date] = last_contract
-                    contract = last_contract
+                if contract in history_contracts.keys():
+                    knock[contract] = knock.get(contract,0) + 1
+                    if knock[contract] >= 3:
+                        print(f"{last_contract} call back but eventually replaced by {contract}")
+                        last_contract = contract
+                    else:
+                        print(f"{contract} was replaced at {history_contracts[contract]}, but was called back on {date}")
+                        main_contracts[date] = last_contract
                 else:
-                    history_contracts.add(last_contract)
-            last_contract = contract
+                    history_contracts[last_contract] = date
+                    last_contract = contract
         return main_contracts
 
-    def get_main_contract_concat_data(self,exchange,bid):
-        main_contracts = self.find_main_contract(exchange,bid)
+    def get_main_contract_concat_data(self,bid):
+        main_contracts = self.find_main_contract(bid)
+        main_contracts = self.cancel_callback(main_contracts)
 
-        contract_list = list(self.exchange_bid_contract_dict[exchange][bid].keys())
+        exchange = self.info.loc[bid,'exchange']
+
+        contract_list = list(self.exchange2bid2contract_dict[exchange][bid].keys())
 
         concat_df = pd.DataFrame()
 
@@ -90,7 +113,7 @@ class Futures():
                 
                 time_end = pd.Timestamp(datetime.datetime.combine(time_end, datetime.time(15, 00))).tz_localize('Asia/Shanghai')
 
-                df = pd.read_parquet(self.exchange_bid_contract_dict[exchange][bid][contract])
+                df = pd.read_parquet(self.exchange2bid2contract_dict[exchange][bid][contract])
 
                 df = df[(df.index >= time_start) & 
                         (df.index <= time_end)]
@@ -115,12 +138,30 @@ class Futures():
 
         return concat_df
     
-    def get_main_contract_minute_price(self,exchange,bid):
-        df = self.get_main_contract_concat_data(exchange,bid)
+    def get_main_contract_minute_price(self,bid):
+        df = self.get_main_contract_concat_data(bid)
         df = self.resample_last(df,'1min')
         ser = df['last_price'] / df['adjust_coefficient'].fillna(1)
         ser.name = bid + '_last_price'
         return ser
+    
+    def all_bids_minute_bar_in_one_exchange(self,exchange,multi_processor=4):
+        bids = self.exchange2bid2contract_dict[exchange].keys()
+
+        res = Parallel(n_jobs=multi_processor)(delayed(self.get_main_contract_minute_price)(bid) for bid in tqdm(bids))
+
+        price_df = pd.concat(res,axis=1,join='outer')
+
+        return price_df
+    
+    def all_bids_minute_bar(self,multi_processor=4):
+        bids = self.bid_list
+
+        res = Parallel(n_jobs=multi_processor)(delayed(self.get_main_contract_minute_price)(bid) for bid in tqdm(bids))
+
+        price_df = pd.concat(res,axis=1,join='outer')
+
+        return price_df
 
     @classmethod
     def resample_last(cls,df,resample_frequency):
@@ -131,15 +172,6 @@ class Futures():
         res_df.index = res_df.index.tz_convert('Asia/Shanghai')
 
         return res_df
-    
-    def all_bid_minute_bar_in_one_exchange(self,exchange,multi_processor=4):
-        bids = self.exchange_bid_contract_dict[exchange].keys()
-
-        res = Parallel(n_jobs=multi_processor)(delayed(self.get_main_contract_minute_price)(exchange,bid) for bid in tqdm(bids))
-
-        price_df = pd.concat(res,axis=1,join='outer')
-
-        return price_df
 
 if __name__=='__main__':
 
