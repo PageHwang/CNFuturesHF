@@ -4,27 +4,31 @@ import numpy as np
 import pandas as pd
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 # fb.signup()
 # %%
-ap2401 = fb.data.futures.lv2(instrumentid = 'AP2401', 
-        from_date='2023-01-01',
-        to_date='2023-12-31', )
-ap2401
-# %%
-bid_list = ['AP', 'CF', 'CJ', 'CY', 'ER', 'FG', 'JR', 'LR', 'MA', 'ME', 'OI', 'PF', 'PK', 'PM', 'PX']
+bid_list = ['CF', 'MA', 'SH', 'OI', 'SM', 'PF', 'AP', 'RM', 'CY', 'SA', 'FG', 'TA', 'PX', 'SR', 'PK', 'UR']
 for bid in bid_list:
     bid_contracts = fb.futures.info(underlyingid = bid)
     contracts = bid_contracts[(bid_contracts.index>=bid+'2301')&(bid_contracts.index<=bid+'2412')].sort_index().index.tolist()
     print(bid,contracts)
-# %%
-    for contract in contracts:
-        df = fb.data.futures.lv2(instrumentid = contract,
-        from_date='2023-01-01',
-        to_date='2023-12-31', )
-        if df is not None:
-                df.to_parquet('data/{}/{}.parquet'.format(bid,contract))
-                time.sleep(60)
-        else:
-             print(contract,'no data')
+
+    path = f'/Users/page/Downloads/data/{bid}/'
+    if not os.path.exists(path):
+        os.mkdir(path)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        for contract in contracts:
+            print(f'start download {contract}')
+            df = fb.data.futures.lv1(instrumentid = contract,
+            from_date='2023-01-01',
+            to_date='2023-12-31', )
+            if df is not None:
+                    df.to_parquet(path+f'{contract}.parquet')
+                    time.sleep(1)
+            else:
+                print(contract,'no data')
+
+    print(f'----------finish download {bid}-------------')
 
 # %%
